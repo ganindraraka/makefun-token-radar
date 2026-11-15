@@ -10,16 +10,20 @@
 // only from the snapshot's own figures, and every term is stated on the page:
 //
 //   tvl        = tvl_usd                          (whole dollars, the protocol's own TVL)
-//   flow       = clamp(change_7d, -50, 100) / 100      (seven-day growth, winsorised and scaled)
+//   flow       = clamp(change_7d, -60, 120) / 100      (seven-day growth, winsorised and scaled)
 //   age        = days since listed_at, else UNKNOWN_AGE_DAYS
 //
-//   flowMult    = 1 + flow x GROWTH_WEIGHT        (reward positive growth, penalise negative)
+//   flowMult    = growth(flow)                    (an asymmetric, concave curve — see growthMultiplier)
 //   maturityMult= MATURITY_FLOOR + min(age,YOUNG_AGE)/YOUNG_AGE x RISING   (proven protocols)
 //   youthMult   = age < YOUNG_AGE ? YOUTH_BOOST + (age/YOUNG_AGE) x (1-YOUTH_BOOST) : 1
 //                                                 (a small upside boost for very young singles)
 //   categoryAdj = the category's capital multiple, e.g. an allocator's TVL counts less than a DEX's
+//   breadthMult = 1 + CHAIN_BOOST x min(chains, CHAIN_SATURATION)/CHAIN_SATURATION
+//                                                 (a protocol deployed widely is a stronger subject)
+//   floorMult   = early rows just below the watchlist floor get a small lift that fades with depth
 //
-//   implied = round( tvl x BASE_MULTIPLE x categoryAdj x flowMult x maturityMult x youthMult )
+//   implied = round( tvl x BASE_MULTIPLE x categoryAdj x flowMult x maturityMult x youthMult
+//                          x breadthMult x floorMult )
 //
 // BASE_MULTIPLE is near the median of live-token protocols' market cap over TVL, so an unremarkable
 // pre-token protocol's implied value lands near what the market pays for a comparable live one. No
@@ -55,6 +59,8 @@ export interface Snapshot {
 export interface ModelConstants {
   base_multiple: number;
   growth_weight: number;
+  growth_down_weight: number;
+  growth_curve: number;
   growth_floor: number;
   growth_cap: number;
   maturity_floor: number;
@@ -62,22 +68,32 @@ export interface ModelConstants {
   young_age_days: number;
   youth_boost: number;
   unknown_age_days: number;
+  chain_boost: number;
+  chain_saturation: number;
+  floor_proximity_boost: number;
+  floor_proximity_span: number;
 }
 
 export const MODEL: ModelConstants = {
   base_multiple: 0.22,
-  growth_weight: 0.9,
-  growth_floor: -50,
-  growth_cap: 100,
-  maturity_floor: 0.55,
-  maturity_rise: 0.45,
+  growth_weight: 0.8,
+  growth_down_weight: 0.55,
+  growth_curve: 0.85,
+  growth_floor: -60,
+  growth_cap: 120,
+  maturity_floor: 0.5,
+  maturity_rise: 0.5,
   young_age_days: 240,
   youth_boost: 1.18,
   unknown_age_days: 300,
+  chain_boost: 0.12,
+  chain_saturation: 4,
+  floor_proximity_boost: 0.08,
+  floor_proximity_span: 0.5,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -115,6 +131,8 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     youth_multiplier: number;
+    breadth_multiplier: number;
+    floor_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -137,6 +155,8 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   youth_multiplier: number;
+  breadth_multiplier: number;
+  floor_multiplier: number;
   farm_steps: string[];
 }
 
@@ -196,6 +216,19 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
  * than a DEX's or a lending market's own book, so its TVL counts a little less; a protocol that runs
  * its own chain or an exchange-like venue counts a little more. Keyed by DefiLlama's own category
  * strings, never by a protocol's name.
+ *
+ * The tiers, strongest claim first, are fixed multipliers rather than sliding ones so a reader can
+ * reproduce any row by hand:
+ *   1.15  a chain, a CEX or a CeDeFi venue: the protocol is the settlement layer itself;
+ *   1.10  a DEX, a perpetual/derivative book or a lending/CDP/stablecoin issuer:
+ *         the TVL is the protocol's own risk-bearing capital;
+ *   1.05  a yield venue, a liquidity manager, a prediction market or an insurance writer:
+ *         the TVL is capital the protocol actively steers;
+ *   1.00  everything else: BTC anchors, index products and unnamed categories (the neutral case);
+ *   0.95  an RWA or payments rail: real capital, but it moves through rather than sticks;
+ *   0.90  a bridge: the TVL is other people's TVL waiting to cross;
+ *   0.85  a liquid-staking or restaking wrapper: a receipt of a claim that already exists;
+ *   0.78  a curator or allocator: someone else's capital under a mandate, the weakest claim.
  */
 export function categoryMultiplier(category: string | null): number {
   const c = (category ?? '').toLowerCase();
@@ -203,11 +236,12 @@ export function categoryMultiplier(category: string | null): number {
   if (c.includes('curator') || c.includes('allocator')) return 0.78;
   if (c.includes('liquid staking') || c.includes('liquid restak') || c.includes('restak') || c.includes('staking pool')) return 0.85;
   if (c.includes('canonical bridge') || c.includes('cross chain bridge') || c.includes('bridge')) return 0.9;
-  if (c.includes('rwa') || c.includes('insurance') || c.includes('payments')) return 0.95;
-  if (c.includes('chain') || c.includes('cex') || c.includes('cedeFi')) return 1.1;
-  if (c.includes('dex') || c.includes('perpetual') || c.includes('derivative')) return 1.05;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral') || c.includes('stable') || c.includes('synthetics')) return 1.05;
-  if (c.includes('yield') || c.includes('farm') || c.includes('basis')) return 1;
+  if (c.includes('rwa') || c.includes('payments') || c.includes('card')) return 0.95;
+  if (c.includes('insurance')) return 1.0;
+  if (c.includes('chain') || c.includes('cex') || c.includes('cedefi')) return 1.15;
+  if (c.includes('dex') || c.includes('perpetual') || c.includes('derivative') || c.includes('leveraged farm')) return 1.1;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral') || c.includes('stable') || c.includes('synthetics')) return 1.1;
+  if (c.includes('yield') || c.includes('farm') || c.includes('basis') || c.includes('liquidity manager') || c.includes('prediction')) return 1.05;
   return 1;
 }
 
@@ -219,14 +253,67 @@ export interface ValueParts {
   growthMult: number;
   maturityMult: number;
   youthMult: number;
+  breadthMult: number;
+  floorMult: number;
   age: number | null;
 }
 
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): ValueParts {
+/**
+ * The growth multiplier: an asymmetric, concave curve over clamped seven-day change.
+ *
+ *   - Concave (GROWTH_CURVE < 1): a 20% week is worth much more than a 2% one, but a 120% week is
+ *     not worth six times a 20% one. TVL prints at the extremes are usually one deposit or one
+ *     withdrawal, so the curve keeps its shape through the middle and flattens at the ends.
+ *   - Asymmetric (GROWTH_DOWN_WEIGHT < GROWTH_WEIGHT): a fall of x% costs less than a rise of x%
+ *     earns. A protocol whose TVL dipped in a rough week is not thereby a worse subject; a protocol
+ *     whose TVL is being used more is. The downside leg is deliberately gentler.
+ *
+ * growthPct is signed; the curve applies sign(s) x |pct|^curve, kept continuous through 0.
+ */
+export function growthMultiplier(growthPct: number, model: ModelConstants): number {
+  const magnitude = Math.pow(Math.abs(growthPct) / 100, model.growth_curve);
+  const weight = growthPct >= 0 ? model.growth_weight : model.growth_down_weight;
+  return 1 + Math.sign(growthPct) * magnitude * weight;
+}
+
+/**
+ * The chain-breadth multiplier: a small, saturating lift for a protocol deployed on more chains.
+ *
+ *   breadthMult = 1 + CHAIN_BOOST x min(chains, CHAIN_SATURATION) / CHAIN_SATURATION
+ *
+ * A protocol live on several chains has more places to be used, so a little more claim on a future
+ * token. It saturates at CHAIN_SATURATION because past a handful of chains the extra deployments
+ * are often thin copies, and a protocol with no named chain gets the neutral multiplier.
+ */
+export function chainBreadthMultiplier(chains: string[], model: ModelConstants): number {
+  if (chains.length === 0) return 1;
+  const spread = Math.min(chains.length, model.chain_saturation) / model.chain_saturation;
+  return 1 + model.chain_boost * spread;
+}
+
+/**
+ * The floor-proximity multiplier: a small lift for an early row sitting just below the watchlist floor.
+ *
+ *   depth  = (floor_usd - tvl_usd) / floor_usd          (how far below the floor, in floor units)
+ *   floorMult = 1 + FLOOR_PROXIMITY_BOOST x clamp(1 - depth / SPAN, 0, 1)
+ *
+ * A protocol just under $50M of TVL is nearly what the house's rule would have kept, and it is the
+ * kind of protocol a reader can actually farm now; one far below the floor is earlier and riskier.
+ * Watchlist rows (at or above the floor, depth <= 0) get the full lift, so the term never reorders
+ * the coverage rows among themselves; it only lifts the near-floor early rows over the deep ones.
+ */
+export function floorProximityMultiplier(tvlUsd: number, floorUsd: number, model: ModelConstants): number {
+  if (floorUsd <= 0) return 1;
+  const depth = (floorUsd - tvlUsd) / floorUsd;
+  const nearness = Math.min(1, Math.max(0, 1 - depth / model.floor_proximity_span));
+  return 1 + model.floor_proximity_boost * nearness;
+}
+
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants, floorUsd = 0): ValueParts {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const growthMult = growthMultiplier(growthPct, model);
 
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.young_age_days) / model.young_age_days) * model.maturity_rise;
@@ -236,9 +323,11 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const youthMult = ageForModel < model.young_age_days ? model.youth_boost + (ageForModel / model.young_age_days) * (1 - model.youth_boost) : 1;
 
   const categoryMult = categoryMultiplier(protocol.category);
+  const breadthMult = chainBreadthMultiplier(protocol.chains, model);
+  const floorMult = floorProximityMultiplier(protocol.tvl_usd, floorUsd, model);
   const base = protocol.tvl_usd * model.base_multiple * categoryMult;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * youthMult));
-  return { implied, categoryMult, growthPct, growthMult, maturityMult, youthMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * youthMult * breadthMult * floorMult));
+  return { implied, categoryMult, growthPct, growthMult, maturityMult, youthMult, breadthMult, floorMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -278,7 +367,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const parts = impliedValue(p, snapshot.as_of, model);
+    const parts = impliedValue(p, snapshot.as_of, model, snapshot.floor_usd);
     return { p, ...parts };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -299,18 +388,18 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     implied_value_usd: s.implied,
     model: {
       base_multiple: model.base_multiple,
-      category_multiplier: round4(s.categoryMult),
+      category_multiplier: s.categoryMult,
       growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      youth_multiplier: round4(s.youthMult),
+      growth_multiplier: s.growthMult,
+      maturity_multiplier: s.maturityMult,
+      youth_multiplier: s.youthMult,
+      breadth_multiplier: s.breadthMult,
+      floor_multiplier: s.floorMult,
       age_days: s.age,
     },
     farm_steps: planStrings(s.p, s.age, s.implied),
   }));
 }
-
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -473,6 +562,8 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     youth_multiplier: row.model.youth_multiplier,
+    breadth_multiplier: row.model.breadth_multiplier,
+    floor_multiplier: row.model.floor_multiplier,
     farm_steps: row.farm_steps,
   };
 }

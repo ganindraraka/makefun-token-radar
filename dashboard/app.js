@@ -20,6 +20,14 @@
     if (Math.abs(n) >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
     return usd.format(n);
   }
+  // The same scale with a fixed 2dp so two adjacent cells line up in the monospace column.
+  function fmtUsdExact(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+    if (Math.abs(n) >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
+    if (Math.abs(n) >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
+    return usd.format(n);
+  }
   function fmtPct(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
@@ -30,18 +38,27 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
   function round2(n) { return Math.round(n * 100) / 100; }
+  function cmpName(a, b) { return a.name.localeCompare(b.name, 'en'); }
 
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
+  // The multiplication order matches lib/model.ts exactly (base, then each multiplier left to right),
+  // so the recompute is the same floating-point expression and lands on the same integer.
   function impliedOf(row) {
     var m = DATA.model;
     var growth = Math.min(m.growth_cap, Math.max(m.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * m.growth_weight;
+    // The growth curve is asymmetric and concave: sign x |pct|^curve x weight, gentler on the down leg.
+    var curve = m.growth_curve !== undefined ? m.growth_curve : 1;
+    var downWeight = m.growth_down_weight !== undefined ? m.growth_down_weight : m.growth_weight;
+    var magnitude = Math.pow(Math.abs(growth) / 100, curve);
+    var growthMult = 1 + Math.sign(growth) * magnitude * (growth >= 0 ? m.growth_weight : downWeight);
     var age = row.age_days === null || row.age_days === undefined ? m.unknown_age_days : row.age_days;
     var maturity = m.maturity_floor + (Math.min(Math.max(age, 0), m.young_age_days) / m.young_age_days) * m.maturity_rise;
     var youth = age < m.young_age_days ? m.youth_boost + (age / m.young_age_days) * (1 - m.youth_boost) : 1;
-    var cat = row.category_multiplier;
-    return Math.max(1, Math.round(row.tvl_usd * m.base_multiple * cat * growthMult * maturity * youth));
+    var breadth = row.breadth_multiplier !== undefined ? row.breadth_multiplier : 1;
+    var floor = row.floor_multiplier !== undefined ? row.floor_multiplier : 1;
+    var base = row.tvl_usd * m.base_multiple * row.category_multiplier;
+    return Math.max(1, Math.round(base * growthMult * maturity * youth * breadth * floor));
   }
 
   function el(tag, attrs) {
@@ -94,17 +111,25 @@
       return hay.indexOf(q) >= 0;
     });
   }
+  // Sorting: the primary key per the header, then a deterministic tiebreak (name, then slug) so two
+  // rows that compare equal never swap between renders. state.dir is -1 for descending, +1 ascending.
   function sortedRows(list) {
     var key = state.sort;
+    function value(r) {
+      if (key === 'name') return r.name.toLowerCase();
+      if (key === 'tvl') return r.tvl_usd;
+      if (key === 'growth') return r.change_7d === null || r.change_7d === undefined ? -Infinity : r.change_7d;
+      if (key === 'age') return r.age_days === null || r.age_days === undefined ? Infinity : r.age_days;
+      if (key === 'rank') return r.rank;
+      return r.implied_value_usd;
+    }
     return list.slice().sort(function (a, b) {
-      var av, bv;
-      if (key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
-      else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
-      else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
-      else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
-      else { av = a.implied_value_usd; bv = b.implied_value_usd; }
+      var av = value(a);
+      var bv = value(b);
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
+      var byName = cmpName(a, b);
+      if (byName !== 0) return byName;
       return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
     });
   }
@@ -163,9 +188,14 @@
   function boardTable() {
     var list = sortedRows(filteredRows());
     if (list.length === 0) {
+      var query = state.q.trim();
+      var bits = [];
+      if (query) bits.push('matching \u201c' + query + '\u201d');
+      if (state.category !== 'all') bits.push('in ' + state.category);
+      var what = bits.length ? 'No pre-token protocol ' + bits.join(' ') : 'No pre-token protocol matches those filters';
       return el('div', { class: 'panel' }, el('div', { class: 'empty' },
-        el('h2', { text: 'No protocol matches that filter' }),
-        el('p', { text: 'Clear the search or pick another category to see the board again.' }),
+        el('h2', { text: what }),
+        el('p', { text: 'The board holds ' + DATA.rows.length + ' pre-token protocols across ' + DATA.live.length + ' live ones set aside. Clear the search or pick another category to see the board again.' }),
         el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; q.value = ''; category.value = 'all'; writeHash(); render(); } })
       ));
     }
@@ -193,7 +223,7 @@
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar' + (early ? ' early' : ''), 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          el('b', { text: fmtUsd(r.implied_value_usd) })
+          el('b', { text: fmtUsdExact(r.implied_value_usd) })
         )),
         el('td', null, badge(r))
       ));
@@ -203,7 +233,7 @@
         el('table', null,
           el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model breakdown and farm plan.' }),
           el('thead', null, el('tr', null,
-            sortHeader('implied', 'Rank'),
+            sortHeader('rank', 'Rank'),
             sortHeader('name', 'Protocol'),
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
@@ -224,6 +254,13 @@
       if (!ql) return true;
       return [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase().indexOf(ql) >= 0;
     });
+    if (list.length === 0) {
+      return el('div', { class: 'panel' }, el('div', { class: 'empty' },
+        el('h2', { text: 'No live-token protocol matches' }),
+        el('p', { text: 'The live view holds the ' + DATA.live.length + ' protocols that already trade. Switch to Pre-token for the ranked board, or clear the search.' }),
+        el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; q.value = ''; category.value = 'all'; writeHash(); render(); } })
+      ));
+    }
     var tbody = el('tbody');
     list.forEach(function (r) {
       tbody.appendChild(el('tr', null,
@@ -247,15 +284,80 @@
     );
   }
 
+  // ---- a small explainer computed from the rows actually on the board ----
+  // Every number here is derived from DATA.rows (and DATA.live), never typed in, so the page states
+  // the model it ran over this snapshot rather than the model in the abstract.
+  function modelStats() {
+    var rows = DATA.rows;
+    var n = rows.length || 1;
+    var byCat = {};
+    var sum = 0;
+    var lo = Infinity;
+    var hi = 0;
+    var boosted = 0;
+    var watchlist = 0;
+    var nearFloor = 0;
+    var growthHi = 0;
+    var growthLo = Infinity;
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      sum += r.implied_value_usd;
+      if (r.implied_value_usd < lo) lo = r.implied_value_usd;
+      if (r.implied_value_usd > hi) hi = r.implied_value_usd;
+      var key = String(r.category_multiplier);
+      byCat[key] = (byCat[key] || 0) + 1;
+      if (r.breadth_multiplier !== undefined && r.breadth_multiplier > 1) boosted++;
+      if (r.rank <= DATA.watchlist_size || r.tvl_usd >= DATA.floor_usd) watchlist++;
+      if (r.tvl_usd < DATA.floor_usd && r.tvl_usd >= DATA.floor_usd * 0.5) nearFloor++;
+      if (r.growth_multiplier > growthHi) growthHi = r.growth_multiplier;
+      if (r.growth_multiplier < growthLo) growthLo = r.growth_multiplier;
+    }
+    if (rows.length === 0) { lo = 0; growthLo = 0; }
+    var catKeys = Object.keys(byCat).sort(function (a, b) { return parseFloat(b) - parseFloat(a); });
+    return {
+      n: rows.length,
+      mean: Math.round(sum / n),
+      lo: lo,
+      hi: hi,
+      byCat: catKeys,
+      catCount: byCat,
+      boosted: boosted,
+      watchlist: watchlist,
+      early: rows.length - watchlist,
+      nearFloor: nearFloor,
+      growthHi: growthHi,
+      growthLo: growthLo,
+      live: DATA.live.length
+    };
+  }
+
   function modelPanel() {
     var m = DATA.model;
+    var s = modelStats();
+    var catList = s.byCat.map(function (k) { return '\u00d7' + k + ' (' + s.catCount[k] + ')'; }).join(', ');
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot\u2019s own figures. No protocol name is special-cased and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot\u2019s own figures. No protocol name is special-cased and no row is hand-picked. The figures below are computed from the ' + s.n + ' rows on this board.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd \u00d7 ' + m.base_multiple + ' \u00d7 category_adj \u00d7 (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 \u00d7 ' + m.growth_weight + ') \u00d7 (' + m.maturity_floor + ' + min(age_days, ' + m.young_age_days + ') / ' + m.young_age_days + ' \u00d7 ' + m.maturity_rise + ') \u00d7 youth(age) )'
+        'implied = round( tvl_usd \u00d7 ' + m.base_multiple + ' \u00d7 category_adj \u00d7 growth(change_7d) \u00d7 (' + m.maturity_floor + ' + min(age_days, ' + m.young_age_days + ') / ' + m.young_age_days + ' \u00d7 ' + m.maturity_rise + ') \u00d7 youth(age) \u00d7 breadth(chains) \u00d7 floor_proximity )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since DefiLlama first listed the protocol, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. category_adj is the protocol\u2019s own category\u2019s capital multiple (an allocator\u2019s TVL counts a little less than a DEX\u2019s). youth(age) gives a young pre-token protocol a small upside boost of up to ' + round2((m.youth_boost - 1) * 100) + '% that fades by ' + m.young_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
+      el('div', { class: 'statgrid' },
+        stat('Rows on the board', String(s.n), (s.watchlist) + ' at or above the floor, ' + s.early + ' early'),
+        stat('Implied values', fmtUsd(s.lo) + ' \u2013 ' + fmtUsd(s.hi), 'mean ' + fmtUsd(s.mean)),
+        stat('Category multipliers in play', String(s.byCat.length), catList),
+        stat('Growth multipliers', round2(s.growthLo) + ' \u2013 ' + round2(s.growthHi), 'asymmetric and concave in change_7d'),
+        stat('Chain breadth applied to', s.boosted + ' rows', 'up to +' + round2(m.chain_boost * 100) + '% at ' + m.chain_saturation + '+ chains'),
+        stat('Early rows near the floor', String(s.nearFloor), 'within half a floor of the watchlist, lifted up to +' + round2(m.floor_proximity_boost * 100) + '%')
+      ),
+      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since DefiLlama first listed the protocol, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. category_adj is the protocol\u2019s own category\u2019s capital multiple (an allocator\u2019s TVL counts a little less than a DEX\u2019s). growth(change_7d) is concave and asymmetric: a rise of x% is worth a little more than a fall of x% costs, and extreme weeks flatten. youth(age) gives a young pre-token protocol a small upside boost of up to ' + round2((m.youth_boost - 1) * 100) + '% that fades by ' + m.young_age_days + ' days. breadth(chains) lifts a protocol deployed on more chains, up to ' + m.chain_saturation + '. The ' + s.live + ' live-token protocols are set aside with their market caps shown.' })
+    );
+  }
+
+  function stat(label, value, sub) {
+    return el('div', { class: 'stat' },
+      el('span', { class: 'stat-label', text: label }),
+      el('b', { class: 'num', text: value }),
+      el('span', { class: 'stat-sub', text: sub })
     );
   }
 
@@ -284,11 +386,13 @@
         el('div', null, el('span', { text: '\u00d7 base multiple' }), el('b', { class: 'num', text: String(DATA.model.base_multiple) })),
         el('div', null, el('span', { text: '\u00d7 category adj' }), el('b', { class: 'num', text: String(row.category_multiplier) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num ' + (row.change_7d === null ? '' : row.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: '\u00d7 growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
+        el('div', null, el('span', { text: '\u00d7 growth multiplier' }), el('b', { class: 'num', text: round2(row.growth_multiplier).toFixed(2) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: '\u00d7 maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: '\u00d7 youth multiplier' }), el('b', { class: 'num', text: String(row.youth_multiplier) })),
-        el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
+        el('div', null, el('span', { text: '\u00d7 maturity multiplier' }), el('b', { class: 'num', text: round2(row.maturity_multiplier).toFixed(2) })),
+        el('div', null, el('span', { text: '\u00d7 youth multiplier' }), el('b', { class: 'num', text: round2(row.youth_multiplier).toFixed(2) })),
+        el('div', null, el('span', { text: '\u00d7 chain breadth' }), el('b', { class: 'num', text: round2(row.breadth_multiplier !== undefined ? row.breadth_multiplier : 1).toFixed(2) })),
+        el('div', null, el('span', { text: '\u00d7 floor proximity' }), el('b', { class: 'num', text: round2(row.floor_multiplier !== undefined ? row.floor_multiplier : 1).toFixed(2) })),
+        el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsdExact(row.implied_value_usd) }))
       ),
       el('p', { class: 'note', text: 'The page recomputes this row as ' + fmtUsd(impliedOf(row)) + (impliedOf(row) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate derived from the snapshot, not a price.' })
     ));

@@ -101,6 +101,11 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .model { padding: var(--s5); display: grid; gap: var(--s3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.8; color: var(--ink-soft); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--s4); overflow-wrap: anywhere; }
+.statgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--s3); }
+.stat { display: grid; gap: 2px; padding: var(--s3); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-2); }
+.stat-label { color: var(--muted); font-size: 12px; }
+.stat b { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.stat-sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .empty { padding: var(--s7) var(--s5); text-align: center; display: grid; gap: var(--s3); justify-items: center; }
 .empty p { color: var(--muted); }
 .button { min-height: 38px; padding: 0 var(--s4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface); }
