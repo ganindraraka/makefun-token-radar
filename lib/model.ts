@@ -204,8 +204,10 @@ function finite(value: unknown, fallback: number): number {
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
-  const a = Date.parse(`${asOf}T00:00:00Z`);
-  const b = Date.parse(`${listedAt}T00:00:00Z`);
+  // Date.parse handles both the snapshot's date-only form and provider ISO timestamps.
+  // Normalising the date-only value avoids locale-dependent parsing across Node versions.
+  const a = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(asOf) ? `${asOf}T00:00:00Z` : asOf);
+  const b = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(listedAt) ? `${listedAt}T00:00:00Z` : listedAt);
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
@@ -271,9 +273,11 @@ export interface ValueParts {
  * growthPct is signed; the curve applies sign(s) x |pct|^curve, kept continuous through 0.
  */
 export function growthMultiplier(growthPct: number, model: ModelConstants): number {
-  const magnitude = Math.pow(Math.abs(growthPct) / 100, model.growth_curve);
-  const weight = growthPct >= 0 ? model.growth_weight : model.growth_down_weight;
-  return 1 + Math.sign(growthPct) * magnitude * weight;
+  const bounded = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(growthPct, 0)));
+  const magnitude = Math.pow(Math.abs(bounded) / 100, model.growth_curve);
+  const weight = bounded >= 0 ? model.growth_weight : model.growth_down_weight;
+  // Keep the multiplier positive even if a future tuning pass makes the downside weight larger.
+  return Math.max(0.05, 1 + Math.sign(bounded) * magnitude * weight);
 }
 
 /**
@@ -286,8 +290,9 @@ export function growthMultiplier(growthPct: number, model: ModelConstants): numb
  * are often thin copies, and a protocol with no named chain gets the neutral multiplier.
  */
 export function chainBreadthMultiplier(chains: string[], model: ModelConstants): number {
-  if (chains.length === 0) return 1;
-  const spread = Math.min(chains.length, model.chain_saturation) / model.chain_saturation;
+  const unique = new Set(chains.map((c) => c.trim().toLowerCase()).filter(Boolean));
+  if (unique.size === 0 || model.chain_saturation <= 0) return 1;
+  const spread = Math.min(unique.size, model.chain_saturation) / model.chain_saturation;
   return 1 + model.chain_boost * spread;
 }
 
@@ -303,10 +308,11 @@ export function chainBreadthMultiplier(chains: string[], model: ModelConstants):
  * the coverage rows among themselves; it only lifts the near-floor early rows over the deep ones.
  */
 export function floorProximityMultiplier(tvlUsd: number, floorUsd: number, model: ModelConstants): number {
-  if (floorUsd <= 0) return 1;
-  const depth = (floorUsd - tvlUsd) / floorUsd;
-  const nearness = Math.min(1, Math.max(0, 1 - depth / model.floor_proximity_span));
-  return 1 + model.floor_proximity_boost * nearness;
+  const span = finite(model.floor_proximity_span, 0.5);
+  if (floorUsd <= 0 || span <= 0) return 1;
+  const depth = (floorUsd - Math.max(0, finite(tvlUsd, 0))) / floorUsd;
+  const nearness = Math.min(1, Math.max(0, 1 - depth / span));
+  return Math.max(0.05, 1 + finite(model.floor_proximity_boost, 0) * nearness);
 }
 
 export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants, floorUsd = 0): ValueParts {
@@ -320,12 +326,14 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
 
   // A very young protocol is still on its launch curve: a small upside boost that fades to 1 as it
   // ages. An unknown age gets the boost only if its listed_at was absent (treated as young).
-  const youthMult = ageForModel < model.young_age_days ? model.youth_boost + (ageForModel / model.young_age_days) * (1 - model.youth_boost) : 1;
+  // Missing dates are uncertain, so keep them neutral instead of rewarding or penalising them.
+  const youthMult = age === null ? 1 : ageForModel < model.young_age_days ? model.youth_boost + (ageForModel / model.young_age_days) * (1 - model.youth_boost) : 1;
 
   const categoryMult = categoryMultiplier(protocol.category);
   const breadthMult = chainBreadthMultiplier(protocol.chains, model);
   const floorMult = floorProximityMultiplier(protocol.tvl_usd, floorUsd, model);
-  const base = protocol.tvl_usd * model.base_multiple * categoryMult;
+  const tvl = Math.max(0, finite(protocol.tvl_usd, 0));
+  const base = tvl * model.base_multiple * categoryMult;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult * youthMult * breadthMult * floorMult));
   return { implied, categoryMult, growthPct, growthMult, maturityMult, youthMult, breadthMult, floorMult, age };
 }
@@ -361,7 +369,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   // The early radar: pre-token protocols below the watchlist floor, by TVL, capped. Never a replacement
   // for a watchlist row: a chosen protocol stays chosen.
   const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
+    .filter((p) => !chosen.has(p.slug) && isRankable(p) && Number.isFinite(p.tvl_usd) && p.tvl_usd >= 0 && p.tvl_usd < snapshot.floor_usd)
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
@@ -607,7 +615,7 @@ export function parseSnapshot(text: string): Snapshot {
   const protocols = o.protocols.map((v, i) => {
     if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
     const p = v as Record<string, unknown>;
-    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
+    if (typeof p.slug !== 'string' || p.slug.trim() === '' || typeof p.name !== 'string' || p.name.trim() === '' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd) || p.tvl_usd < 0) {
       throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
     }
     return {
@@ -623,12 +631,18 @@ export function parseSnapshot(text: string): Snapshot {
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
     };
   });
+  const seen = new Set<string>();
+  for (const p of protocols) {
+    if (seen.has(p.slug)) throw new SnapshotError(`snapshot.json repeats protocol slug ${p.slug}`);
+    seen.add(p.slug);
+  }
+  const uniqueWatchlist = [...new Set(o.watchlist as string[])];
   return {
     as_of: o.as_of,
     source: o.source,
     floor_usd: o.floor_usd,
     protocols,
-    watchlist: o.watchlist as string[],
+    watchlist: uniqueWatchlist,
   };
 }
 
